@@ -23,21 +23,21 @@ type Space struct {
 }
 
 type Page struct {
-	ID           string `json:"id"`
-	SpaceID      string `json:"space_id"`
-	ParentID     string `json:"parent_id,omitempty"`
-	Title        string `json:"title"`
-	Slug         string `json:"slug"`
-	Body         string `json:"body"`
-	Status       string `json:"status"` // draft, published
-	Author       string `json:"author,omitempty"`
-	Position     int    `json:"position"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
-	WordCount    int    `json:"word_count"`
-	RevisionCount int   `json:"revision_count"`
-	CommentCount int    `json:"comment_count"`
-	ChildCount   int    `json:"child_count"`
+	ID            string `json:"id"`
+	SpaceID       string `json:"space_id"`
+	ParentID      string `json:"parent_id,omitempty"`
+	Title         string `json:"title"`
+	Slug          string `json:"slug"`
+	Body          string `json:"body"`
+	Status        string `json:"status"` // draft, published
+	Author        string `json:"author,omitempty"`
+	Position      int    `json:"position"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+	WordCount     int    `json:"word_count"`
+	RevisionCount int    `json:"revision_count"`
+	CommentCount  int    `json:"comment_count"`
+	ChildCount    int    `json:"child_count"`
 }
 
 type Revision struct {
@@ -97,6 +97,7 @@ func Open(dataDir string) (*DB, error) {
 			return nil, fmt.Errorf("migrate: %w", err)
 		}
 	}
+	db.Exec(`CREATE TABLE IF NOT EXISTS extras(resource TEXT NOT NULL,record_id TEXT NOT NULL,data TEXT NOT NULL DEFAULT '{}',PRIMARY KEY(resource, record_id))`)
 	return &DB{db: db}, nil
 }
 
@@ -368,4 +369,56 @@ func (d *DB) Stats() Stats {
 		}
 	}
 	return s
+}
+
+// ─── Extras: generic key-value storage for personalization custom fields ───
+
+func (d *DB) GetExtras(resource, recordID string) string {
+	var data string
+	err := d.db.QueryRow(
+		`SELECT data FROM extras WHERE resource=? AND record_id=?`,
+		resource, recordID,
+	).Scan(&data)
+	if err != nil || data == "" {
+		return "{}"
+	}
+	return data
+}
+
+func (d *DB) SetExtras(resource, recordID, data string) error {
+	if data == "" {
+		data = "{}"
+	}
+	_, err := d.db.Exec(
+		`INSERT INTO extras(resource, record_id, data) VALUES(?, ?, ?)
+		 ON CONFLICT(resource, record_id) DO UPDATE SET data=excluded.data`,
+		resource, recordID, data,
+	)
+	return err
+}
+
+func (d *DB) DeleteExtras(resource, recordID string) error {
+	_, err := d.db.Exec(
+		`DELETE FROM extras WHERE resource=? AND record_id=?`,
+		resource, recordID,
+	)
+	return err
+}
+
+func (d *DB) AllExtras(resource string) map[string]string {
+	out := make(map[string]string)
+	rows, _ := d.db.Query(
+		`SELECT record_id, data FROM extras WHERE resource=?`,
+		resource,
+	)
+	if rows == nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, data string
+		rows.Scan(&id, &data)
+		out[id] = data
+	}
+	return out
 }

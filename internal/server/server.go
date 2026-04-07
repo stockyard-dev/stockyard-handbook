@@ -2,20 +2,24 @@ package server
 
 import (
 	"encoding/json"
+	"github.com/stockyard-dev/stockyard-handbook/internal/store"
+	"io"
 	"log"
 	"net/http"
-
-	"github.com/stockyard-dev/stockyard-handbook/internal/store"
+	"os"
+	"path/filepath"
 )
 
 type Server struct {
-	db     *store.DB
-	mux    *http.ServeMux
-	limits Limits
+	db      *store.DB
+	mux     *http.ServeMux
+	limits  Limits
+	dataDir string
+	pCfg    map[string]json.RawMessage
 }
 
-func New(db *store.DB, limits Limits) *Server {
-	s := &Server{db: db, mux: http.NewServeMux(), limits: limits}
+func New(db *store.DB, limits Limits, dataDir string) *Server {
+	s := &Server{db: db, mux: http.NewServeMux(), limits: limits, dataDir: dataDir}
 
 	s.mux.HandleFunc("GET /api/spaces", s.listSpaces)
 	s.mux.HandleFunc("POST /api/spaces", s.createSpace)
@@ -44,39 +48,82 @@ func New(db *store.DB, limits Limits) *Server {
 	s.mux.HandleFunc("GET /ui", s.dashboard)
 	s.mux.HandleFunc("GET /ui/", s.dashboard)
 	s.mux.HandleFunc("GET /", s.root)
-s.mux.HandleFunc("GET /api/tier",func(w http.ResponseWriter,r *http.Request){writeJSON(w,200,map[string]any{"tier":s.limits.Tier,"upgrade_url":"https://stockyard.dev/handbook/"})})
+	s.mux.HandleFunc("GET /api/tier", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"tier": s.limits.Tier, "upgrade_url": "https://stockyard.dev/handbook/"})
+	})
+	s.loadPersonalConfig()
+	s.mux.HandleFunc("GET /api/config", s.configHandler)
+	s.mux.HandleFunc("GET /api/extras/{resource}", s.listExtras)
+	s.mux.HandleFunc("GET /api/extras/{resource}/{id}", s.getExtras)
+	s.mux.HandleFunc("PUT /api/extras/{resource}/{id}", s.putExtras)
 	return s
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json"); w.WriteHeader(code); json.NewEncoder(w).Encode(v)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
 }
-func writeErr(w http.ResponseWriter, code int, msg string) { writeJSON(w, code, map[string]string{"error": msg}) }
+func writeErr(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
+}
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" { http.NotFound(w, r); return }
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	http.Redirect(w, r, "/ui", http.StatusFound)
 }
 
-func (s *Server) listSpaces(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]any{"spaces": orEmpty(s.db.ListSpaces())}) }
+func (s *Server) listSpaces(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"spaces": orEmpty(s.db.ListSpaces())})
+}
 func (s *Server) createSpace(w http.ResponseWriter, r *http.Request) {
 	var sp store.Space
-	if err := json.NewDecoder(r.Body).Decode(&sp); err != nil { writeErr(w, 400, "invalid json"); return }
-	if sp.Name == "" { writeErr(w, 400, "name required"); return }
-	if err := s.db.CreateSpace(&sp); err != nil { writeErr(w, 500, err.Error()); return }
+	if err := json.NewDecoder(r.Body).Decode(&sp); err != nil {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+	if sp.Name == "" {
+		writeErr(w, 400, "name required")
+		return
+	}
+	if err := s.db.CreateSpace(&sp); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
 	writeJSON(w, 201, sp)
 }
 func (s *Server) getSpace(w http.ResponseWriter, r *http.Request) {
-	sp := s.db.GetSpace(r.PathValue("id")); if sp == nil { writeErr(w, 404, "not found"); return }; writeJSON(w, 200, sp)
+	sp := s.db.GetSpace(r.PathValue("id"))
+	if sp == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
+	writeJSON(w, 200, sp)
 }
 func (s *Server) updateSpace(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id"); ex := s.db.GetSpace(id); if ex == nil { writeErr(w, 404, "not found"); return }
-	var sp store.Space; json.NewDecoder(r.Body).Decode(&sp)
-	if sp.Name == "" { sp.Name = ex.Name }; if sp.Slug == "" { sp.Slug = ex.Slug }
-	s.db.UpdateSpace(id, &sp); writeJSON(w, 200, s.db.GetSpace(id))
+	id := r.PathValue("id")
+	ex := s.db.GetSpace(id)
+	if ex == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
+	var sp store.Space
+	json.NewDecoder(r.Body).Decode(&sp)
+	if sp.Name == "" {
+		sp.Name = ex.Name
+	}
+	if sp.Slug == "" {
+		sp.Slug = ex.Slug
+	}
+	s.db.UpdateSpace(id, &sp)
+	writeJSON(w, 200, s.db.GetSpace(id))
 }
 func (s *Server) deleteSpace(w http.ResponseWriter, r *http.Request) {
-	s.db.DeleteSpace(r.PathValue("id")); writeJSON(w, 200, map[string]string{"deleted": "ok"})
+	s.db.DeleteSpace(r.PathValue("id"))
+	writeJSON(w, 200, map[string]string{"deleted": "ok"})
 }
 func (s *Server) pageTree(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"tree": orEmpty(s.db.PageTree(r.PathValue("id")))})
@@ -87,56 +134,190 @@ func (s *Server) listPages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"pages": orEmpty(s.db.ListPages(q.Get("space_id"), q.Get("parent_id")))})
 }
 func (s *Server) createPage(w http.ResponseWriter, r *http.Request) {
-	var p store.Page; if err := json.NewDecoder(r.Body).Decode(&p); err != nil { writeErr(w, 400, "invalid json"); return }
-	if p.Title == "" { writeErr(w, 400, "title required"); return }
-	if p.SpaceID == "" { writeErr(w, 400, "space_id required"); return }
-	if err := s.db.CreatePage(&p); err != nil { writeErr(w, 500, err.Error()); return }
+	var p store.Page
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+	if p.Title == "" {
+		writeErr(w, 400, "title required")
+		return
+	}
+	if p.SpaceID == "" {
+		writeErr(w, 400, "space_id required")
+		return
+	}
+	if err := s.db.CreatePage(&p); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
 	writeJSON(w, 201, s.db.GetPage(p.ID))
 }
 func (s *Server) getPage(w http.ResponseWriter, r *http.Request) {
-	p := s.db.GetPage(r.PathValue("id")); if p == nil { writeErr(w, 404, "not found"); return }; writeJSON(w, 200, p)
+	p := s.db.GetPage(r.PathValue("id"))
+	if p == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
+	writeJSON(w, 200, p)
 }
 func (s *Server) updatePage(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id"); ex := s.db.GetPage(id); if ex == nil { writeErr(w, 404, "not found"); return }
-	var p store.Page; json.NewDecoder(r.Body).Decode(&p)
-	if p.Title == "" { p.Title = ex.Title }; if p.Body == "" { p.Body = ex.Body }
-	if p.Status == "" { p.Status = ex.Status }; if p.Slug == "" { p.Slug = ex.Slug }
-	if p.SpaceID == "" { p.SpaceID = ex.SpaceID }
-	author := p.Author; if author == "" { author = ex.Author }
-	s.db.UpdatePage(id, &p, author); writeJSON(w, 200, s.db.GetPage(id))
+	id := r.PathValue("id")
+	ex := s.db.GetPage(id)
+	if ex == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
+	var p store.Page
+	json.NewDecoder(r.Body).Decode(&p)
+	if p.Title == "" {
+		p.Title = ex.Title
+	}
+	if p.Body == "" {
+		p.Body = ex.Body
+	}
+	if p.Status == "" {
+		p.Status = ex.Status
+	}
+	if p.Slug == "" {
+		p.Slug = ex.Slug
+	}
+	if p.SpaceID == "" {
+		p.SpaceID = ex.SpaceID
+	}
+	author := p.Author
+	if author == "" {
+		author = ex.Author
+	}
+	s.db.UpdatePage(id, &p, author)
+	writeJSON(w, 200, s.db.GetPage(id))
 }
 func (s *Server) deletePage(w http.ResponseWriter, r *http.Request) {
-	s.db.DeletePage(r.PathValue("id")); writeJSON(w, 200, map[string]string{"deleted": "ok"})
+	s.db.DeletePage(r.PathValue("id"))
+	writeJSON(w, 200, map[string]string{"deleted": "ok"})
 }
 
 func (s *Server) listRevisions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"revisions": orEmpty(s.db.ListRevisions(r.PathValue("id")))})
 }
 func (s *Server) getRevision(w http.ResponseWriter, r *http.Request) {
-	rev := s.db.GetRevision(r.PathValue("id")); if rev == nil { writeErr(w, 404, "not found"); return }; writeJSON(w, 200, rev)
+	rev := s.db.GetRevision(r.PathValue("id"))
+	if rev == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
+	writeJSON(w, 200, rev)
 }
 
 func (s *Server) listComments(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"comments": orEmpty(s.db.ListComments(r.PathValue("id")))})
 }
 func (s *Server) createComment(w http.ResponseWriter, r *http.Request) {
-	pid := r.PathValue("id"); if s.db.GetPage(pid) == nil { writeErr(w, 404, "page not found"); return }
-	var c store.Comment; json.NewDecoder(r.Body).Decode(&c)
-	if c.Body == "" { writeErr(w, 400, "body required"); return }
-	c.PageID = pid; s.db.CreateComment(&c); writeJSON(w, 201, c)
+	pid := r.PathValue("id")
+	if s.db.GetPage(pid) == nil {
+		writeErr(w, 404, "page not found")
+		return
+	}
+	var c store.Comment
+	json.NewDecoder(r.Body).Decode(&c)
+	if c.Body == "" {
+		writeErr(w, 400, "body required")
+		return
+	}
+	c.PageID = pid
+	s.db.CreateComment(&c)
+	writeJSON(w, 201, c)
 }
 func (s *Server) deleteComment(w http.ResponseWriter, r *http.Request) {
-	s.db.DeleteComment(r.PathValue("id")); writeJSON(w, 200, map[string]string{"deleted": "ok"})
+	s.db.DeleteComment(r.PathValue("id"))
+	writeJSON(w, 200, map[string]string{"deleted": "ok"})
 }
 
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query().Get("q"); sid := r.URL.Query().Get("space_id")
-	if q == "" { writeJSON(w, 200, map[string]any{"pages": []any{}}); return }
+	q := r.URL.Query().Get("q")
+	sid := r.URL.Query().Get("space_id")
+	if q == "" {
+		writeJSON(w, 200, map[string]any{"pages": []any{}})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"pages": orEmpty(s.db.SearchPages(sid, q))})
 }
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, s.db.Stats()) }
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	st := s.db.Stats(); writeJSON(w, 200, map[string]any{"status": "ok", "service": "handbook", "pages": st.Pages, "spaces": st.Spaces})
+	st := s.db.Stats()
+	writeJSON(w, 200, map[string]any{"status": "ok", "service": "handbook", "pages": st.Pages, "spaces": st.Spaces})
 }
-func orEmpty[T any](s []T) []T { if s == nil { return []T{} }; return s }
+func orEmpty[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
+}
 func init() { log.SetFlags(log.LstdFlags | log.Lshortfile) }
+
+// ─── personalization (auto-added) ──────────────────────────────────
+
+func (s *Server) loadPersonalConfig() {
+	path := filepath.Join(s.dataDir, "config.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("%s: warning: could not parse config.json: %v", "handbook", err)
+		return
+	}
+	s.pCfg = cfg
+	log.Printf("%s: loaded personalization from %s", "handbook", path)
+}
+
+func (s *Server) configHandler(w http.ResponseWriter, r *http.Request) {
+	if s.pCfg == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("{}"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s.pCfg)
+}
+
+func (s *Server) listExtras(w http.ResponseWriter, r *http.Request) {
+	resource := r.PathValue("resource")
+	all := s.db.AllExtras(resource)
+	out := make(map[string]json.RawMessage, len(all))
+	for id, data := range all {
+		out[id] = json.RawMessage(data)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+func (s *Server) getExtras(w http.ResponseWriter, r *http.Request) {
+	resource := r.PathValue("resource")
+	id := r.PathValue("id")
+	data := s.db.GetExtras(resource, id)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(data))
+}
+
+func (s *Server) putExtras(w http.ResponseWriter, r *http.Request) {
+	resource := r.PathValue("resource")
+	id := r.PathValue("id")
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":"read body"}`, 400)
+		return
+	}
+	var probe map[string]any
+	if err := json.Unmarshal(body, &probe); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, 400)
+		return
+	}
+	if err := s.db.SetExtras(resource, id, string(body)); err != nil {
+		http.Error(w, `{"error":"save failed"}`, 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":"saved"}`))
+}
